@@ -117,7 +117,7 @@
       <div class="set">
         <details class="manual">
           <summary>Load odds manually</summary>
-          <p class="note" style="margin-top:8px">Paste a raw response from the <code>/v4/sports/{sport}/odds</code> endpoint, or choose saved JSON files.</p>
+          <p class="note" style="margin-top:8px">Paste a raw response from the <code>/v4/sports/{sport}/odds</code> or <code>/events/{id}/odds</code> endpoint, or choose saved JSON files.</p>
           <textarea id="pasteBox" spellcheck="false" placeholder='[{"id": "...", "home_team": "...", "bookmakers": [...]}]'></textarea>
           <div class="btns">
             <button class="btn small" id="pasteBtn" type="button">Load pasted odds</button>
@@ -173,7 +173,8 @@
             </ol>
             <p>Running your own copy? Serve the folder over http rather than opening the file directly, because browsers block API calls from files on disk:</p>
             <div class="cmd"><code id="cmdText">python3 -m http.server 8000</code><button class="btn small" type="button" id="copyCmd">Copy</button></div>
-            <p>Each scan costs one credit per sport per market when you pick ten books or fewer. Four sports with all three markets is 12 credits.</p>
+            <p>Each scan costs one credit per sport per market when you pick ten books or fewer. Four sports with moneylines, spreads and totals is 12 credits.</p>
+            <p>Team totals cost more. The Odds API only serves them one game at a time, so they add one credit per game on every scan: a 14-game NFL Sunday is 14 more credits. Games already under way are skipped unless you include games in progress.</p>
           </section>
           <section>
             <h2>Checking that the fair line works</h2>
@@ -184,6 +185,7 @@
             <h2>Before you bet</h2>
             <ul>
               <li>Edges close quickly. Confirm the price at the book before you place it.</li>
+              <li>Team totals are often missing from the sharp book, so they are priced off the consensus of other books more often. Consensus is a weaker fair line than Pinnacle, so treat team-total edges with more suspicion.</li>
               <li>Edges over 12% get a <em>Check line</em> tag. They usually mean a stale price, a different line, or a market the feed mislabeled.</li>
               <li>Pinnacle prices in this feed come from its public site and can lag by a minute or two.</li>
               <li>A positive-EV bet still loses often. A 5% edge on a +160 underdog loses about 60% of the time; the profit only shows across hundreds of bets.</li>

@@ -1,7 +1,9 @@
 // Fair Line engine: pure functions for odds math, devig, +EV and arbitrage detection.
 // Works in the browser (global FL) and in Node (module.exports) so it can be tested directly.
 var FL = (function () {
-  var MARKET_KEYS = ['h2h', 'spreads', 'totals'];
+  // team_totals is an additional market: The Odds API serves it per event, not from the bulk /odds call
+  var MARKET_KEYS = ['h2h', 'spreads', 'totals', 'team_totals'];
+  var FEATURED = ['h2h', 'spreads', 'totals'];
 
   // ---- odds conversions ----
   function toDec(price) {
@@ -56,7 +58,37 @@ var FL = (function () {
     return decs.reduce(function (a, d) { return a + 1 / d; }, 0) - 1;
   }
 
-  // ---- normalise API events into market groups (one group = one event + market + line) ----
+  // ---- normalise API events into market groups (one group = one event + market + team + line) ----
+  // a book's market splits into parts: {line, team, outcomes}. Team totals carry the team in each
+  // outcome's description and hold one Over/Under pair per team.
+  function marketParts(m, home, away) {
+    if (m.key === 'spreads') {
+      var o = m.outcomes.filter(function (x) { return x.name === home; })[0] || m.outcomes[0];
+      if (o.point == null) return [];
+      var line = o.name === home ? Number(o.point) : -Number(o.point);
+      return [{ line: line, team: null, outcomes: m.outcomes.filter(function (oc) {
+        return (oc.name === home ? Number(oc.point) : -Number(oc.point)) === line;
+      }) }];
+    }
+    if (m.key === 'totals') {
+      if (m.outcomes[0].point == null) return [];
+      var tl = Number(m.outcomes[0].point);
+      return [{ line: tl, team: null, outcomes: m.outcomes.filter(function (oc) { return Number(oc.point) === tl; }) }];
+    }
+    if (m.key === 'team_totals') {
+      var parts = {}, order = [];
+      m.outcomes.forEach(function (oc) {
+        var team = oc.description;
+        if ((team !== home && team !== away) || oc.point == null) return;
+        var k = team + '|' + Number(oc.point);
+        if (!parts[k]) { parts[k] = { line: Number(oc.point), team: team, outcomes: [] }; order.push(k); }
+        parts[k].outcomes.push(oc);
+      });
+      return order.map(function (k) { return parts[k]; });
+    }
+    return [{ line: null, team: null, outcomes: m.outcomes }];
+  }
+
   function buildGroups(events) {
     var groups = new Map();
     (events || []).forEach(function (ev) {
@@ -66,48 +98,37 @@ var FL = (function () {
         (bk.markets || []).forEach(function (m) {
           if (MARKET_KEYS.indexOf(m.key) < 0 || !m.outcomes || !m.outcomes.length) return;
           var updated = Date.parse(m.last_update || bk.last_update || '') || 0;
-          var line = null;
-          if (m.key === 'spreads') {
-            var o = m.outcomes.filter(function (x) { return x.name === home; })[0] || m.outcomes[0];
-            if (o.point == null) return;
-            line = o.name === home ? Number(o.point) : -Number(o.point);
-          } else if (m.key === 'totals') {
-            if (m.outcomes[0].point == null) return;
-            line = Number(m.outcomes[0].point);
-          }
-          var gid = ev.id + '|' + m.key + '|' + (line === null ? '' : line);
-          var g = groups.get(gid);
-          if (!g) {
-            g = {
-              id: gid, eventId: ev.id, sportKey: ev.sport_key || '',
-              sportTitle: ev.sport_title || sportName(ev.sport_key),
-              home: home, away: away, commence: commence,
-              type: m.key, line: line, names: [], books: {}
-            };
-            groups.set(gid, g);
-          }
-          var entry = { title: bk.title || bk.key, prices: {}, links: {}, updated: updated };
-          m.outcomes.forEach(function (oc) {
-            if (m.key === 'spreads') {
-              var hp = oc.name === home ? Number(oc.point) : -Number(oc.point);
-              if (hp !== line) return;
+          marketParts(m, home, away).forEach(function (part) {
+            var line = part.line, team = part.team;
+            var gid = ev.id + '|' + m.key + '|' + (team ? team + '|' : '') + (line === null ? '' : line);
+            var g = groups.get(gid);
+            if (!g) {
+              g = {
+                id: gid, eventId: ev.id, sportKey: ev.sport_key || '',
+                sportTitle: ev.sport_title || sportName(ev.sport_key),
+                home: home, away: away, commence: commence,
+                type: m.key, line: line, team: team, names: [], books: {}
+              };
+              groups.set(gid, g);
             }
-            if (m.key === 'totals' && Number(oc.point) !== line) return;
-            var d = toDec(oc.price);
-            if (!(d > 1)) return;
-            entry.prices[oc.name] = d;
-            var link = oc.link || m.link || bk.link;
-            if (link) entry.links[oc.name] = link;
-            if (g.names.indexOf(oc.name) < 0) g.names.push(oc.name);
+            var entry = { title: bk.title || bk.key, prices: {}, links: {}, updated: updated };
+            part.outcomes.forEach(function (oc) {
+              var d = toDec(oc.price);
+              if (!(d > 1)) return;
+              entry.prices[oc.name] = d;
+              var link = oc.link || m.link || bk.link;
+              if (link) entry.links[oc.name] = link;
+              if (g.names.indexOf(oc.name) < 0) g.names.push(oc.name);
+            });
+            g.books[bk.key] = entry;
           });
-          g.books[bk.key] = entry;
         });
       });
     });
     var out = [];
     groups.forEach(function (g) {
       var rank = function (n) {
-        if (g.type === 'totals') return n === 'Over' ? 0 : 1;
+        if (g.type === 'totals' || g.type === 'team_totals') return n === 'Over' ? 0 : 1;
         if (n === g.away) return 0;
         if (n === g.home) return 1;
         if (n === 'Draw') return 2;
@@ -124,6 +145,7 @@ var FL = (function () {
   function outcomeLabel(g, n) {
     if (g.type === 'spreads') return n + ' ' + fmtPt(n === g.home ? g.line : -g.line);
     if (g.type === 'totals') return n + ' ' + g.line;
+    if (g.type === 'team_totals') return g.team + ' ' + n + ' ' + g.line;
     return n === 'Draw' ? 'Draw' : n;
   }
 
@@ -277,16 +299,17 @@ var FL = (function () {
     return out;
   }
 
-  // ---- odds screen: one line per event and market type ----
+  // ---- odds screen: one line per event and market type (per team for team totals) ----
   function screenRows(groups, cfg, type) {
     var byEvent = new Map();
     groups.forEach(function (g) {
       if (g.type !== type || !inWindow(g, cfg)) return;
-      var cur = byEvent.get(g.eventId);
+      var key = g.eventId + '|' + (g.team || '');
+      var cur = byEvent.get(key);
       var score = function (x) {
         return (x.books[cfg.refBook] ? 1000 : 0) + Object.keys(x.books).length;
       };
-      if (!cur || score(g) > score(cur)) byEvent.set(g.eventId, g);
+      if (!cur || score(g) > score(cur)) byEvent.set(key, g);
     });
     var rows = [];
     byEvent.forEach(function (g) {
@@ -294,7 +317,8 @@ var FL = (function () {
       var ref = getFair ? getFair(null) : null;
       rows.push({ g: g, fair: ref ? ref.fair : null, ref: ref });
     });
-    rows.sort(function (a, b) { return a.g.commence - b.g.commence || a.g.away.localeCompare(b.g.away); });
+    var teamRank = function (g) { return g.team ? (g.team === g.away ? 0 : 1) : 0; };
+    rows.sort(function (a, b) { return a.g.commence - b.g.commence || a.g.away.localeCompare(b.g.away) || teamRank(a.g) - teamRank(b.g); });
     return rows;
   }
 
@@ -327,13 +351,16 @@ var FL = (function () {
   };
   function sigmaFor(sportKey, type) {
     var s = SIGMA[sportKey] || (/^soccer_/.test(sportKey || '') ? [1.6, 1.6] : [12, 15]);
+    if (type === 'team_totals') return s[1] / Math.SQRT2; // one team's score, roughly half the game total's variance
     return type === 'totals' ? s[1] : s[0];
   }
 
   // fair win probability for one side at a given number.
-  // bet: {eventId, sportKey, type, name, line, home}; line is the group's line (home handicap or total)
+  // bet: {eventId, sportKey, type, name, line, home, team}; line is the group's line (home handicap or total)
   function fairAtLine(groups, bet, cfg, excludeBook) {
-    var same = groups.filter(function (g) { return g.eventId === bet.eventId && g.type === bet.type; });
+    var same = groups.filter(function (g) {
+      return g.eventId === bet.eventId && g.type === bet.type && (bet.type !== 'team_totals' || g.team === bet.team);
+    });
     if (!same.length) return null;
     var priced = [];
     same.forEach(function (g) {
@@ -386,6 +413,11 @@ var FL = (function () {
       var homeMargin = hs - as;
       var v = bet.name === bet.home ? homeMargin + bet.line : -homeMargin - bet.line;
       res = v > 0 ? 'win' : v < 0 ? 'loss' : 'push';
+    } else if (bet.type === 'team_totals') {
+      var ts = sc[bet.team];
+      if (!isFinite(ts)) return null;
+      var tw = bet.name === 'Over' ? ts - bet.line : bet.line - ts;
+      res = tw > 0 ? 'win' : tw < 0 ? 'loss' : 'push';
     } else {
       var w = bet.name === 'Over' ? hs + as - bet.line : bet.line - (hs + as);
       res = w > 0 ? 'win' : w < 0 ? 'loss' : 'push';
@@ -427,7 +459,7 @@ var FL = (function () {
   }
 
   return {
-    MARKET_KEYS: MARKET_KEYS, toDec: toDec, toAm: toAm, fmtAm: fmtAm, fmtPt: fmtPt,
+    MARKET_KEYS: MARKET_KEYS, FEATURED: FEATURED, toDec: toDec, toAm: toAm, fmtAm: fmtAm, fmtPt: fmtPt,
     devig: devig, hold: hold, buildGroups: buildGroups, fullMarket: fullMarket,
     findEV: findEV, findArbs: findArbs, screenRows: screenRows, sportName: sportName, isFresh: isFresh,
     ncdf: ncdf, ninv: ninv, sigmaFor: sigmaFor, fairAtLine: fairAtLine, gradeBet: gradeBet,

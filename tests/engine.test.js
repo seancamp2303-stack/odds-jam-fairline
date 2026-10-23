@@ -122,3 +122,53 @@ test('arbitrage: Lions total split across BetMGM and Caesars', () => {
   const r = lions.legs.map(l => l.frac * l.dec);
   near(r[0], r[1], 1e-9);
 });
+
+test('team totals: one group per team and line, Over first, team in the label', () => {
+  const groups = FL.buildGroups(sampleEvents(Date.now()));
+  const knicks = groups.filter(g => g.type === 'team_totals' && g.home === 'New York Knicks');
+  assert.deepStrictEqual(knicks.map(g => g.team).sort(), ['Boston Celtics', 'New York Knicks']);
+  const nyk = knicks.find(g => g.team === 'New York Knicks');
+  assert.deepStrictEqual(nyk.names, ['Over', 'Under']);
+  assert.strictEqual(nyk.labels.Over, 'New York Knicks Over 112.5');
+  // a description that isn't one of the two teams (a player prop, say) is ignored
+  const ev = { id: 'x', sport_key: 'basketball_nba', home_team: 'A', away_team: 'B', commence_time: new Date().toISOString(), bookmakers: [
+    { key: 'draftkings', markets: [{ key: 'team_totals', outcomes: [
+      { name: 'Over', description: 'A', price: 1.9, point: 110.5 }, { name: 'Under', description: 'A', price: 1.9, point: 110.5 },
+      { name: 'Over', description: 'Some Player', price: 1.9, point: 20.5 }] }] }] };
+  const gs = FL.buildGroups([ev]);
+  assert.strictEqual(gs.length, 1);
+  assert.strictEqual(gs[0].team, 'A');
+});
+
+test('team totals: +EV against Pinnacle, consensus where Pinnacle has none', () => {
+  const now = Date.now();
+  const evs = FL.findEV(FL.buildGroups(sampleEvents(now)), baseCfg(now)).filter(e => e.g.type === 'team_totals');
+  const nyk = evs.find(e => e.label === 'New York Knicks Over 112.5' && e.book === 'fanduel');
+  assert.ok(nyk && nyk.ref.kind === 'book');
+  near(nyk.ev, FL.devig(FL.fullMarket(nyk.g, 'pinnacle'), 'power')[0] * FL.toDec(112) - 1, 1e-9);
+  const phi = evs.find(e => e.label === 'Philadelphia Eagles Under 25.5' && e.book === 'betmgm');
+  assert.ok(phi && phi.ref.kind === 'consensus');
+});
+
+test('team totals: arbitrage stays within one team and line', () => {
+  const now = Date.now();
+  const arb = FL.findArbs(FL.buildGroups(sampleEvents(now)), baseCfg(now))
+    .find(a => a.g.type === 'team_totals' && a.g.team === 'Philadelphia Eagles');
+  assert.ok(arb);
+  assert.deepStrictEqual(arb.legs.map(l => l.book).sort(), ['betmgm', 'draftkings']);
+  near(arb.profit, 1 / (1 / 2.0 + 1 / 2.08) - 1, 1e-9);
+});
+
+test('team totals: closing fair line reads the right team, shifts along a narrower curve', () => {
+  const now = Date.now();
+  const groups = FL.buildGroups(sampleEvents(now));
+  const cfg = baseCfg(now);
+  const g = groups.find(x => x.type === 'team_totals' && x.team === 'Boston Celtics');
+  const bet = { eventId: g.eventId, sportKey: g.sportKey, type: 'team_totals', team: 'Boston Celtics', name: 'Over', line: g.line, home: g.home };
+  const exact = FL.fairAtLine(groups, bet, cfg);
+  assert.ok(!exact.est);
+  near(exact.p, FL.devig(FL.fullMarket(g, 'pinnacle'), 'power')[0], 1e-9);
+  const moved = FL.fairAtLine(groups, { ...bet, line: g.line + 2 }, cfg);
+  assert.ok(moved.est && moved.p < exact.p);
+  near(FL.sigmaFor('basketball_nba', 'team_totals'), 18 / Math.SQRT2, 1e-9);
+});

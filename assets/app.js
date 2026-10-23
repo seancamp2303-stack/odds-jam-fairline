@@ -23,7 +23,7 @@
     ['pinnacle', 'Pinnacle'], ['betonlineag', 'BetOnline'], ['lowvig', 'LowVig'], ['novig', 'Novig'],
     ['prophetx', 'ProphetX'], ['betfair_ex_eu', 'Betfair Exchange'], ['', 'None: consensus only']
   ];
-  var MARKETS = [['h2h', 'Moneyline'], ['spreads', 'Spread'], ['totals', 'Total']];
+  var MARKETS = [['h2h', 'Moneyline'], ['spreads', 'Spread'], ['totals', 'Total'], ['team_totals', 'Team total']];
   var DEFAULTS = {
     apiKey: '', sports: ['americanfootball_nfl', 'americanfootball_ncaaf', 'basketball_nba', 'icehockey_nhl'],
     markets: ['h2h', 'spreads', 'totals'], sharp: 'pinnacle', fallback: true, method: 'power',
@@ -78,6 +78,7 @@
   function marketName(g) {
     if (g.type === 'h2h') return isSoccer(g) || g.names.indexOf('Draw') >= 0 ? 'Match result' : 'Moneyline';
     if (g.type === 'spreads') return /icehockey/.test(g.sportKey) ? 'Puck line' : /baseball/.test(g.sportKey) ? 'Run line' : 'Spread';
+    if (g.type === 'team_totals') return 'Team total';
     return 'Total';
   }
   function displayNow() { return st.source === 'live' ? Date.now() : st.asOf; }
@@ -112,9 +113,12 @@
     if (s.sharp && list.indexOf(s.sharp) < 0) list.unshift(s.sharp);
     return list;
   }
+  function featuredMarkets() { return s.markets.filter(function (m) { return FL.FEATURED.indexOf(m) >= 0; }); }
+  function wantTeamTotals() { return s.markets.indexOf('team_totals') >= 0; }
+  // team totals cost 1 credit per game (per 10 books) on top of the bulk scan, so the total depends on the slate
   function costPerScan() {
-    var books = scanBooks().length;
-    return { cost: s.sports.length * s.markets.length * Math.max(1, Math.ceil(books / 10)), mult: Math.max(1, Math.ceil(books / 10)), books: books };
+    var books = scanBooks().length, mult = Math.max(1, Math.ceil(books / 10));
+    return { cost: s.sports.length * featuredMarkets().length * mult, mult: mult, books: books, tt: wantTeamTotals() };
   }
   function cfg() {
     var maxOdds = Number(s.maxOdds);
@@ -169,37 +173,86 @@
     return true;
   }
 
+  // run fn over items with at most n requests in flight
+  async function pool(items, n, fn) {
+    var next = 0;
+    var worker = async function () { while (next < items.length) { var i = next++; await fn(items[i], i); } };
+    var ws = [];
+    for (var k = 0; k < Math.min(n, items.length); k++) ws.push(worker());
+    await Promise.all(ws);
+  }
+  // add one event-odds response's bookmakers onto an event from the bulk scan
+  function mergeBooks(ev, books) {
+    ev.bookmakers = ev.bookmakers || [];
+    (books || []).forEach(function (b) {
+      var have = ev.bookmakers.filter(function (x) { return x.key === b.key; })[0];
+      if (!have) { ev.bookmakers.push(b); return; }
+      var keys = (b.markets || []).map(function (m) { return m.key; });
+      have.markets = (have.markets || []).filter(function (m) { return keys.indexOf(m.key) < 0; }).concat(b.markets || []);
+    });
+  }
+
   async function scanLive() {
     if (st.scanning || needKey()) return;
     if (!s.sports.length || !s.markets.length) { showBanner('warn', 'Pick at least one sport and one market to scan.'); return; }
     st.scanning = true; renderScanBtn();
-    var params = new URLSearchParams({
-      apiKey: s.apiKey.trim(), markets: s.markets.join(','), oddsFormat: 'decimal', dateFormat: 'iso',
+    var featured = featuredMarkets(), wantTT = wantTeamTotals();
+    var base = {
+      apiKey: s.apiKey.trim(), oddsFormat: 'decimal', dateFormat: 'iso',
       bookmakers: scanBooks().join(','), includeLinks: 'true'
-    });
-    if (s.window !== 'all') params.set('commenceTimeTo', iso(Date.now() + Number(s.window) * 3600000));
-    var all = [], errs = [], blocked = false, badKey = false, outOfCredits = false;
-    for (var i = 0; i < s.sports.length; i++) {
-      var sport = s.sports[i];
-      var url = API + '/v4/sports/' + encodeURIComponent(sport) + '/odds/?' + params.toString();
-      try {
-        var r = await fetch(url);
-        if (r.status === 429) { await sleep(2000); r = await fetch(url); }
-        readQuota(r);
-        if (r.status === 401) {
-          var body = ''; try { body = (await r.json()).message || ''; } catch (e) { /* ignore */ }
-          if (/quota|usage/i.test(body)) outOfCredits = true; else badKey = true;
-          break;
+    };
+    var to = s.window !== 'all' ? iso(Date.now() + Number(s.window) * 3600000) : null;
+    var all = [], errs = [], blocked = false, badKey = false, outOfCredits = false, ttGames = 0;
+    // one GET with a single retry on rate limiting; returns parsed JSON, or null after recording why it failed
+    var get = async function (url, what) {
+      var r = await fetch(url);
+      if (r.status === 429) { await sleep(2000); r = await fetch(url); }
+      readQuota(r);
+      if (r.status === 401) {
+        var body = ''; try { body = (await r.json()).message || ''; } catch (e) { /* ignore */ }
+        if (/quota|usage/i.test(body)) outOfCredits = true; else badKey = true;
+        return null;
+      }
+      if (!r.ok) {
+        var msg = ''; try { msg = (await r.json()).message || ''; } catch (e) { /* ignore */ }
+        if (what) errs.push(what + ' (' + (msg || 'error ' + r.status) + ')');
+        return null;
+      }
+      return r.json();
+    };
+    try {
+      for (var i = 0; i < s.sports.length && !badKey && !outOfCredits; i++) {
+        var sport = s.sports[i], path = API + '/v4/sports/' + encodeURIComponent(sport);
+        var events = [];
+        if (featured.length) {
+          var p = new URLSearchParams(base); p.set('markets', featured.join(','));
+          if (to) p.set('commenceTimeTo', to);
+          var data = await get(path + '/odds/?' + p.toString(), sportLabel(sport));
+          if (Array.isArray(data)) events = data;
         }
-        if (!r.ok) {
-          var msg = ''; try { msg = (await r.json()).message || ''; } catch (e) { /* ignore */ }
-          errs.push(sportLabel(sport) + ' (' + (msg || 'error ' + r.status) + ')');
-          continue;
+        if (wantTT && !badKey && !outOfCredits) {
+          if (!featured.length) { // the events list is free, so team-totals-only scans still find the games
+            var ep = new URLSearchParams({ apiKey: base.apiKey, dateFormat: 'iso' });
+            if (to) ep.set('commenceTimeTo', to);
+            var list = await get(path + '/events?' + ep.toString(), sportLabel(sport));
+            events = Array.isArray(list) ? list.map(function (ev) { ev.bookmakers = []; return ev; }) : [];
+          }
+          // each game is its own request and credit, so skip games already under way unless they're wanted
+          var now = Date.now();
+          var targets = events.filter(function (ev) { return s.includeLive || Date.parse(ev.commence_time) > now; });
+          var tp = new URLSearchParams(base); tp.set('markets', 'team_totals');
+          var ttErr = 0;
+          await pool(targets, 4, async function (ev) {
+            if (badKey || outOfCredits) return;
+            var d = await get(path + '/events/' + encodeURIComponent(ev.id) + '/odds?' + tp.toString(), null);
+            if (d && d.bookmakers) { mergeBooks(ev, d.bookmakers); ttGames++; }
+            else if (!badKey && !outOfCredits) ttErr++;
+          });
+          if (ttErr) errs.push(sportLabel(sport) + ' team totals (' + ttErr + ' game' + (ttErr === 1 ? '' : 's') + ' didn’t load)');
         }
-        var data = await r.json();
-        if (Array.isArray(data)) all = all.concat(data);
-      } catch (e) { blocked = true; break; }
-    }
+        all = all.concat(events);
+      }
+    } catch (e) { blocked = true; }
     st.scanning = false; renderScanBtn();
     if (blocked) { showBanner('error', BLOCKED); return; }
     if (badKey) { showBanner('error', 'The Odds API rejected that key. Copy it again from your account page at the-odds-api.com.'); return; }
@@ -392,7 +445,7 @@
     list.forEach(function (a, ai) {
       var g = a.g, back = total / a.sum;
       h += '<article class="arb"><header><span class="edge">+' + pct(a.profit, 2) + '</span><div><strong>' + esc(marketName(g)) +
-        (g.type === 'totals' ? ' ' + g.line : '') + '</strong><span class="sub"><span class="tag">' + esc(g.sportTitle) + '</span>' +
+        (g.type === 'totals' ? ' ' + g.line : '') + (g.type === 'team_totals' ? ': ' + esc(g.team) + ' ' + g.line : '') + '</strong><span class="sub"><span class="tag">' + esc(g.sportTitle) + '</span>' +
         esc(gameName(g)) + ' · ' + esc(fmtStart(g.commence, now)) + '</span>' +
         (a.verify ? '<span class="verify" title="Margins this large usually mean one price is stale. Confirm both before betting.">Check lines</span>' : '') +
         '</div></header><div class="legs-wrap"><table class="legs"><thead><tr><th>Bet</th><th>Book</th><th class="r">Odds</th><th class="r">Stake</th><th class="r">Returns</th></tr></thead><tbody>';
@@ -427,7 +480,7 @@
       var g = r.g;
       var refNote = r.ref ? (r.ref.kind === 'book' ? '' : ' · consensus') : ' · no fair line';
       h += '<tr class="evt"><td colspan="' + (cols.length + 2) + '"><span class="tag' + (g.commence <= now ? ' live' : '') + '">' + esc(g.sportTitle) + '</span>' +
-        esc(gameName(g)) + ' <span class="sub" style="display:inline;font-weight:400">· ' + esc(fmtStart(g.commence, now)) + esc(refNote) + '</span></td></tr>';
+        esc(gameName(g)) + (g.team ? ': ' + esc(g.team) : '') + ' <span class="sub" style="display:inline;font-weight:400">· ' + esc(fmtStart(g.commence, now)) + esc(refNote) + '</span></td></tr>';
       g.names.forEach(function (name, i) {
         var best = 0;
         s.myBooks.forEach(function (b) {
@@ -435,7 +488,7 @@
           if (bk && bk.prices[name] && FL.isFresh(g, b, c) && bk.prices[name] > best) best = bk.prices[name];
         });
         var fp = r.fair ? r.fair[i] : null;
-        h += '<tr><td>' + esc(g.labels[name]) + '</td><td class="fair">' + (fp ? price(1 / fp) + '<span class="e">' + pct(fp) + '</span>' : '—') + '</td>';
+        h += '<tr><td>' + esc(g.team ? name + ' ' + g.line : g.labels[name]) + '</td><td class="fair">' + (fp ? price(1 / fp) + '<span class="e">' + pct(fp) + '</span>' : '—') + '</td>';
         cols.forEach(function (b) {
           var bk = g.books[b], d = bk && bk.prices[name];
           if (!d) { h += '<td class="p" style="color:var(--muted)">·</td>'; return; }
@@ -482,9 +535,9 @@
   function sampleBets() { return st.bets.filter(function (b) { return b.sample; }); }
   function countBets() { return realBets().length || st.bets.length; }
   function uniq(a) { return a.filter(function (x, i) { return a.indexOf(x) === i; }); }
-  function betKey(b) { return [b.eventId, b.type, b.line, b.name, b.book].join('|'); }
+  function betKey(b) { return [b.eventId, b.type, b.team || '', b.line, b.name, b.book].join('|'); }
   function isLogged(g, name, book) {
-    var k = [g.eventId, g.type, g.line, name, book].join('|');
+    var k = [g.eventId, g.type, g.team || '', g.line, name, book].join('|');
     return st.bets.some(function (b) { return betKey(b) === k; });
   }
   function betGame(b) { return /^soccer_/.test(b.sportKey || '') ? b.home + ' vs ' + b.away : b.away + ' @ ' + b.home; }
@@ -504,7 +557,7 @@
     return {
       id: Date.now().toString(36) + Math.random().toString(36).slice(2, 7), at: Date.now(), sample: st.source === 'sample',
       eventId: g.eventId, sportKey: g.sportKey, sportTitle: g.sportTitle, home: g.home, away: g.away, commence: g.commence,
-      type: g.type, line: g.line, name: name, label: g.labels[name], market: marketName(g), threeWay: g.names.indexOf('Draw') >= 0,
+      type: g.type, line: g.line, team: g.team || null, name: name, label: g.labels[name], market: marketName(g), threeWay: g.names.indexOf('Draw') >= 0,
       book: book, bookTitle: title, dec: dec, stake: Math.max(1, Math.round(stake || 0)),
       fairAtBet: fairP || null, refAtBet: refText || '', close: null, result: 'open', score: null
     };
@@ -529,7 +582,7 @@
     var c = cfg(), total = Number(s.arbStake) || 0, n = 0;
     a.legs.forEach(function (l) {
       if (isLogged(a.g, l.name, l.book)) return;
-      var f = FL.fairAtLine(st.groups, { eventId: a.g.eventId, sportKey: a.g.sportKey, type: a.g.type, name: l.name, line: a.g.line, home: a.g.home }, c, l.book);
+      var f = FL.fairAtLine(st.groups, { eventId: a.g.eventId, sportKey: a.g.sportKey, type: a.g.type, name: l.name, line: a.g.line, home: a.g.home, team: a.g.team }, c, l.book);
       var refText = f ? (f.kind === 'book' ? bookTitle(s.sharp) : 'Consensus') : '';
       st.bets.unshift(makeBet(a.g, l.name, l.book, l.bookTitle, l.dec, total * l.frac, f ? f.p : null, refText));
       n++;
@@ -606,7 +659,12 @@
   }
   function closeCost() {
     var buckets = closeBuckets(), cost = 0, mult = Math.max(1, Math.ceil(scanBooks().length / 10));
-    Object.keys(buckets).forEach(function (k) { cost += 10 * uniq(buckets[k].map(function (b) { return b.type; })).length * mult; });
+    Object.keys(buckets).forEach(function (k) {
+      var list = buckets[k];
+      cost += 10 * uniq(list.map(function (b) { return b.type; }).filter(function (t) { return t !== 'team_totals'; })).length * mult;
+      // historical team totals come from the per-event endpoint: 10 credits per game
+      cost += 10 * uniq(list.filter(function (b) { return b.type === 'team_totals'; }).map(function (b) { return b.eventId; })).length * mult;
+    });
     return cost;
   }
   async function fetchClosing() {
@@ -614,31 +672,49 @@
     var buckets = closeBuckets(), keys = Object.keys(buckets);
     if (!keys.length) { toast('Every bet that has started already has a closing snapshot.'); return; }
     var got = 0, missing = 0, blocked = false, failMsg = '';
-    setLogBusy(true);
-    for (var i = 0; i < keys.length; i++) {
-      var list = buckets[keys[i]], b0 = list[0];
-      var params = new URLSearchParams({
-        apiKey: s.apiKey.trim(), date: iso(b0.commence - 60000),
-        markets: uniq(list.map(function (b) { return b.type; })).join(','), bookmakers: scanBooks().join(','),
-        oddsFormat: 'decimal', dateFormat: 'iso', eventIds: uniq(list.map(function (b) { return b.eventId; })).join(',')
+    // one snapshot request; returns {groups, at} or null after recording why it failed
+    var snapshot = async function (url, fallbackAt) {
+      var r = await fetch(url);
+      readQuota(r);
+      if (!r.ok) {
+        var m = ''; try { m = (await r.json()).message || ''; } catch (e) { /* ignore */ }
+        failMsg = m || 'error ' + r.status; return null;
+      }
+      var snap = await r.json();
+      var data = Array.isArray(snap.data) ? snap.data : (snap.data ? [snap.data] : []);
+      return { groups: FL.buildGroups(data), at: Date.parse(snap.timestamp) || fallbackAt };
+    };
+    var apply = function (snap, bets) {
+      var c = cfg(); c.now = snap.at;
+      bets.forEach(function (b) {
+        var f = FL.fairAtLine(snap.groups, b, c, b.book);
+        if (f) { b.close = { p: f.p, at: c.now, src: 'snapshot', est: f.est, line: f.line, kind: f.kind }; got++; }
+        else missing++;
       });
-      try {
-        var r = await fetch(API + '/v4/historical/sports/' + encodeURIComponent(b0.sportKey) + '/odds/?' + params.toString());
-        readQuota(r);
-        if (!r.ok) {
-          var m = ''; try { m = (await r.json()).message || ''; } catch (e) { /* ignore */ }
-          failMsg = m || 'error ' + r.status; break;
+    };
+    setLogBusy(true);
+    try {
+      for (var i = 0; i < keys.length && !failMsg; i++) {
+        var list = buckets[keys[i]], b0 = list[0], when = b0.commence - 60000;
+        var base = { apiKey: s.apiKey.trim(), date: iso(when), bookmakers: scanBooks().join(','), oddsFormat: 'decimal', dateFormat: 'iso' };
+        var feat = list.filter(function (b) { return b.type !== 'team_totals'; });
+        if (feat.length) {
+          var p = new URLSearchParams(base);
+          p.set('markets', uniq(feat.map(function (b) { return b.type; })).join(','));
+          p.set('eventIds', uniq(feat.map(function (b) { return b.eventId; })).join(','));
+          var snap = await snapshot(API + '/v4/historical/sports/' + encodeURIComponent(b0.sportKey) + '/odds/?' + p.toString(), when);
+          if (!snap) break;
+          apply(snap, feat);
         }
-        var snap = await r.json();
-        var groups = FL.buildGroups(snap.data || []);
-        var c = cfg(); c.now = Date.parse(snap.timestamp) || b0.commence - 60000;
-        list.forEach(function (b) {
-          var f = FL.fairAtLine(groups, b, c, b.book);
-          if (f) { b.close = { p: f.p, at: c.now, src: 'snapshot', est: f.est, line: f.line, kind: f.kind }; got++; }
-          else missing++;
-        });
-      } catch (e) { blocked = true; break; }
-    }
+        var tt = list.filter(function (b) { return b.type === 'team_totals'; });
+        var ids = uniq(tt.map(function (b) { return b.eventId; }));
+        for (var j = 0; j < ids.length && !failMsg; j++) {
+          var tp = new URLSearchParams(base); tp.set('markets', 'team_totals');
+          var tsnap = await snapshot(API + '/v4/historical/sports/' + encodeURIComponent(b0.sportKey) + '/events/' + encodeURIComponent(ids[j]) + '/odds?' + tp.toString(), when);
+          if (tsnap) apply(tsnap, tt.filter(function (b) { return b.eventId === ids[j]; }));
+        }
+      }
+    } catch (e) { blocked = true; }
     saveBets(); setLogBusy(false); render();
     if (blocked) { showBanner('error', BLOCKED); return; }
     var msg = 'Closing lines saved for ' + got + ' bet' + (got === 1 ? '' : 's') + '.';
@@ -659,7 +735,7 @@
     var books = s.myBooks.length ? s.myBooks : ['draftkings', 'fanduel'];
     for (var i = 0; i < 72 && groups.length; i++) {
       var g = groups[(i * 7) % groups.length], name = g.names[i % 2];
-      var f = FL.fairAtLine(st.groups, { eventId: g.eventId, sportKey: g.sportKey, type: g.type, name: name, line: g.line, home: g.home }, c);
+      var f = FL.fairAtLine(st.groups, { eventId: g.eventId, sportKey: g.sportKey, type: g.type, name: name, line: g.line, home: g.home, team: g.team }, c);
       if (!f) continue;
       var am = FL.toAm((1.01 + rnd() * 0.05) / f.p);
       var dec = FL.toDec(Math.round(am / 5) * 5);
@@ -669,7 +745,7 @@
       out.push({
         id: 'demo' + i, at: commence - 3 * 3600e3, sample: true, demo: true,
         eventId: g.eventId, sportKey: g.sportKey, sportTitle: g.sportTitle, home: g.home, away: g.away, commence: commence,
-        type: g.type, line: g.line, name: name, label: g.labels[name], market: marketName(g), threeWay: false,
+        type: g.type, line: g.line, team: g.team || null, name: name, label: g.labels[name], market: marketName(g), threeWay: false,
         book: bk, bookTitle: bookTitle(bk), dec: dec, stake: Math.round(20 + rnd() * 45), fairAtBet: f.p, refAtBet: 'Pinnacle',
         close: { p: closeP, at: commence - 4 * 60000, src: 'snapshot', est: false }, result: rnd() < closeP ? 'win' : 'loss', score: null
       });
@@ -861,7 +937,7 @@
     }
     if (samp.length) h += '<button class="btn small" type="button" data-act="clearsample">Clear practice bets</button>';
     if (mode === 'real') {
-      h += '<p class="note">Update results grades bets from final scores (2 credits per sport, games from the last 3 days). Closing snapshots read the fair line from the last snapshot before each start time and need a paid Odds API plan (10 credits per market per start time). Without them, closing lines come from your last scan before each game.</p>';
+      h += '<p class="note">Update results grades bets from final scores (2 credits per sport, games from the last 3 days). Closing snapshots read the fair line from the last snapshot before each start time and need a paid Odds API plan (10 credits per market per start time, and 10 per game for team totals). Without them, closing lines come from your last scan before each game.</p>';
     }
     h += '<details class="manual"><summary>Restore from backup</summary><textarea id="restoreBox" spellcheck="false" placeholder="Paste a backup copied from this log"></textarea>' +
       '<div class="btns"><button class="btn small" type="button" data-act="restore">Restore bets</button></div></details>';
@@ -971,12 +1047,15 @@
   }
   function renderCost() {
     var c = costPerScan();
-    var per = c.cost;
-    var h = '<b>' + per + '</b> credits per scan: ' + s.sports.length + ' sports × ' + s.markets.length + ' markets' +
-      (c.mult > 1 ? ' × ' + c.mult + ' (' + c.books + ' books is over 10)' : '') + '. Free plan: 500 a month.';
-    $('#cost').innerHTML = h;
+    var per = c.cost, nf = featuredMarkets().length;
+    var over = c.mult > 1 ? ' × ' + c.mult + ' (' + c.books + ' books is over 10)' : '';
+    var tt = 'Team totals ' + (nf ? 'add ' : 'cost ') + '<b>' + c.mult + '</b> credit' + (c.mult > 1 ? 's' : '') + ' per game, fetched one game at a time: a 14-game NFL Sunday is ' + 14 * c.mult + (nf ? ' more.' : '.');
+    var h = nf ? '<b>' + per + '</b> credits per scan: ' + s.sports.length + ' sports × ' + nf + ' markets' + over + '.' + (c.tt ? ' ' + tt : '')
+               : (c.tt ? tt : '<b>0</b> credits per scan.');
+    $('#cost').innerHTML = h + ' Free plan: 500 a month.';
     var m = Number(s.auto);
-    $('#autoNote').innerHTML = m ? 'Uses about <b class="num">' + Math.round(per * 60 / m) + '</b> credits an hour while this tab is open and visible.' : 'Scans only when you press Scan books.';
+    $('#autoNote').innerHTML = m ? 'Uses about <b class="num">' + Math.round(per * 60 / m) + '</b> credits an hour' + (c.tt ? ', plus team totals for every game,' : '') +
+      ' while this tab is open and visible.' : 'Scans only when you press Scan books.';
   }
   function fillForm() {
     $('#sharp').innerHTML = SHARP_BOOKS.map(function (b) { return '<option value="' + b[0] + '">' + esc(b[1]) + '</option>'; }).join('');

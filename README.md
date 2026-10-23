@@ -10,7 +10,8 @@ Everything runs in the browser. Each visitor brings their own free key from [The
 
 - **Positive EV**: every bet priced above the fair line, with edge, fair odds, fair win %, and a Kelly stake from your bankroll.
 - **Arbitrage**: prices across books whose implied chances sum to under 100%, with the stake split that returns the same amount on any result.
-- **Odds screen**: every book side by side for moneylines, spreads and totals, with the best price highlighted and +EV prices marked.
+- **Team totals**: each team's own over/under, devigged and scanned for +EV and arbitrage like the other markets, graded from that team's score. The Odds API serves them one game at a time, so they cost a credit per game (see below).
+- **Odds screen**: every book side by side for moneylines, spreads, totals and team totals, with the best price highlighted and +EV prices marked.
 - **Bet log**: log bets from the EV and arbitrage tabs, capture the fair price before each game starts, grade results from final scores, and compare actual profit with what the fair line expected.
 - **Courtside**: pick Courtside under Books you bet at and its moneylines, spreads and totals are scanned for +EV and arbitrage like any other book (paid Odds API plan; see below).
 - Four devig methods (power, multiplicative, additive, worst case), consensus fallback when Pinnacle has no line, line-age filter, auto-scan, CSV export.
@@ -50,11 +51,12 @@ Bettors who consistently beat the closing line tend to win over time, and that s
 | Call | Cost |
 | --- | --- |
 | Scan (per sport) | 1 credit per market, up to 10 books; 11–20 books doubles it |
+| Team totals (per game) | 1 credit per game scanned, up to 10 books; games already started are skipped unless you include games in progress |
 | In-season sports list | free |
 | Update results (per sport) | 2 credits, games from the last 3 days |
-| Closing snapshots (paid plans) | 10 credits per market per start time |
+| Closing snapshots (paid plans) | 10 credits per market per start time; team totals 10 per game |
 
-The free plan has 500 credits a month. Four sports with all three markets is 12 credits per scan, about 40 scans a month. Caesars, Fanatics and Courtside odds need a paid plan; on a free key they come back empty, and the page says so after the scan. Picking an eleventh book doubles the cost of each scan.
+The free plan has 500 credits a month. Four sports with moneylines, spreads and totals is 12 credits per scan, about 40 scans a month. Team totals are the expensive one: a full NFL Sunday adds about 14 credits to every scan, so on a free key turn them on for a single sport and scan by hand rather than on auto-scan. Caesars, Fanatics and Courtside odds need a paid plan; on a free key they come back empty, and the page says so after the scan. Picking an eleventh book doubles the cost of each scan.
 
 ## Courtside
 

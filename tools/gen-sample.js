@@ -120,7 +120,40 @@ EVENTS.forEach(([, , , home, , ml, hLine, pHome, total, pOver], i) => {
   ev.bookmakers.push({ key: 'courtside', title: 'Courtside', markets });
 });
 
+// ---- team totals: NBA and NFL only, from their own stream so every other sample price stays put ----
+// Pinnacle hangs them for the NBA games only, so the NFL ones show the consensus fallback.
+const rndTT = mulberry32(777);
+const ttNoise = gaussFrom(rndTT);
+const TT_BOOKS = ['pinnacle', 'draftkings', 'fanduel', 'betmgm', 'williamhill_us', 'espnbet', 'betrivers'];
+EVENTS.forEach(([sk, , , home, , , hLine, , total], i) => {
+  if (sk !== 'basketball_nba' && sk !== 'americanfootball_nfl') return;
+  const ev = events[i], away = ev.away_team;
+  const half = x => Math.round(x - 0.5) + 0.5; // team totals hang on the half point
+  const homeLine = half(total / 2 - hLine / 2), awayLine = half(total / 2 + hLine / 2);
+  ev.bookmakers.forEach(bk => {
+    if (TT_BOOKS.indexOf(bk.key) < 0 || (bk.key === 'pinnacle' && sk !== 'basketball_nba')) return;
+    const sharp = bk.key === 'pinnacle';
+    const u = Math.round((0.5 + rndTT() * 3.5) * 10) / 10;
+    const outcomes = [];
+    [[away, awayLine], [home, homeLine]].forEach(([team, line]) => {
+      const tp = price([0.5, 0.5], sharp ? 0.025 : 0.05, sharp ? 0.003 : 0.01, sharp, ttNoise);
+      outcomes.push({ name: 'Over', description: team, price: tp[0], point: line });
+      outcomes.push({ name: 'Under', description: team, price: tp[1], point: line });
+    });
+    bk.markets.push({ key: 'team_totals', u, outcomes });
+  });
+});
+
 // ---- hand-placed spots so the sample shows each feature ----
+function setTT(home, book, team, name, am) {
+  const ev = events.find(e => e.home_team === home);
+  const m = ev.bookmakers.find(b => b.key === book).markets.find(x => x.key === 'team_totals');
+  m.outcomes.find(x => x.name === name && x.description === team).price = r3(decFromAm(am));
+}
+setTT('New York Knicks', 'fanduel', 'New York Knicks', 'Over', 112);              // team total +EV against Pinnacle
+setTT('New York Knicks', 'fanduel', 'New York Knicks', 'Under', -140);
+setTT('Philadelphia Eagles', 'betmgm', 'Philadelphia Eagles', 'Under', 108);    // team total arb across BetMGM and DraftKings
+setTT('Philadelphia Eagles', 'draftkings', 'Philadelphia Eagles', 'Over', 100);
 function set(home, book, mkt, name, am, extra) {
   const ev = events.find(e => e.home_team === home);
   const bk = ev.bookmakers.find(b => b.key === book);

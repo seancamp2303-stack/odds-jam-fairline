@@ -74,3 +74,12 @@ test('log stats', () => {
   // no fair line at all: price treated as fair, so expected profit is zero
   near(FL.logStats([{ stake: 100, dec: 2.5, fairAtBet: null, close: null, result: 'loss' }]).expPL, 0);
 });
+
+test('team totals grade from the team\'s own score', () => {
+  const final = { completed: true, scores: [{ name: 'Boston Celtics', score: '108' }, { name: 'New York Knicks', score: '115' }] };
+  const bet = { type: 'team_totals', home: 'New York Knicks', away: 'Boston Celtics', team: 'Boston Celtics', line: 110.5, name: 'Under' };
+  assert.strictEqual(FL.gradeBet(bet, final).result, 'win');
+  assert.strictEqual(FL.gradeBet({ ...bet, name: 'Over' }, final).result, 'loss');
+  assert.strictEqual(FL.gradeBet({ ...bet, team: 'New York Knicks', line: 115, name: 'Over' }, final).result, 'push');
+  assert.strictEqual(FL.gradeBet({ ...bet, team: 'Someone Else' }, final), null);
+});
